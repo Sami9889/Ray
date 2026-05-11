@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='UTF-8'>
+<title>Offline FPS Engine</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;overflow:hidden;touch-action:none}
+canvas{display:block;position:absolute;top:0;left:0;width:100%;height:100%}
+#overlay{position:absolute;inset:0;pointer-events:none;z-index:10}
+#scanlines{position:absolute;inset:0;background:repeating-linear-gradient(to bottom,transparent 0,transparent 3px,rgba(0,0,0,.12) 3px,rgba(0,0,0,.12) 4px)}
+#vignette{position:absolute;inset:0;background:radial-gradient(ellipse 80% 70% at 50% 50%,transparent 55%,rgba(0,0,0,.72) 100%)}
+#ui{position:absolute;top:12px;left:14px;color:rgba(180,160,140,.55);font:11px/1 'Courier New',monospace;letter-spacing:3px;z-index:20}
+#joy{position:absolute;bottom:28px;left:28px;width:140px;height:140px;border:1.5px solid rgba(255,255,255,.18);border-radius:50%;z-index:20;touch-action:none}
+#stick{position:absolute;width:58px;height:58px;background:rgba(255,255,255,.18);border-radius:50%;left:41px;top:41px;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id='c'></canvas>
+<div id='overlay'>
+  <div id='scanlines'></div>
+  <div id='vignette'></div>
+</div>
+<div id='ui'>OFFLINE FPS ENGINE</div>
+<div id='joy'><div id='stick'></div></div>
+
+<script>
+// ── CANVAS SETUP ─────────────────────────────────────────
+const c = document.getElementById('c');
+const ctx = c.getContext('2d');
+
+function resize() {
+  c.width = window.innerWidth;
+  c.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── WORLD ─────────────────────────────────────────────────
+const SEED = (Math.random() * 99999999 + 1) | 0;
+
+function hash(x, y) {
+  let h = (SEED * 1234567) ^ (x * 2246822519) ^ (y * 3266489917);
+  h = Math.imul(h ^ (h >>> 16), 2246822519);
+  h = Math.imul(h ^ (h >>> 13), 3266489917);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+// 30% wall probability; 3x3 clear zone around spawn
+function isWall(wx, wy) {
+  const tx = Math.floor(wx), ty = Math.floor(wy);
+  if (tx >= -1 && tx <= 2 && ty >= -1 && ty <= 2) return false;
+  return (hash(tx, ty) % 10) < 3;
+}
+
+// 6 effect types for wall tiles
+function tileEffect(tx, ty) {
+  const h = hash(tx + 77777, ty + 33333);
+  if ((h % 4) !== 0) return -1;
+  return (h >> 6) % 6;
+}
+
+// ── PLAYER ────────────────────────────────────────────────
+let px = 0.5, py = 0.5;
+let pa = Math.PI * 1.5;
+const FOV = Math.PI / 3;
+
+// ── ATMOSPHERE ────────────────────────────────────────────
+let time = 0;
+let flickerB = 1, flickerTimer = 60;
+let heartPulse = 0;
+let bobPhase = 0, bobY = 0, bobX = 0, bobTilt = 0;
+let moveSpeed = 0, landImpact = 0;
+let breathPhase = 0, breathDelta = 0;
+let driftPhase = 0;
+let idleFrames = 0, isMoving = false;
+let peripheralA = 0;
+let tintA = 0, tintR = 0, tintG = 0, tintB2 = 0, tintDecay = 0;
+let distortRow = -1, distortAmt = 0, distortFrames = 0;
+let staticA = 0;
+
+// Fixed ceiling/floor stains per session
+const ceilStains = [], floorStains = [];
+for (let i = 0; i < 12; i++) {
+  const h = hash(i * 41 + 7, i * 23 + 13);
+  ceilStains.push({
+    rx: (h % 1000) / 1000,
+    ry: 0.06 + ((h >> 4) % 200) / 3000,
+    rs: 0.04 + ((h >> 10) % 60) / 1000,
+    a: 0.04 + ((h >> 16) % 5) * 0.01
+  });
+  const h2 = hash(i * 37 + 3, i * 19 + 7);
+  floorStains.push({
+    rx: (h2 % 1000) / 1000,
+    ry: 0.06 + ((h2 >> 4) % 200) / 3000,
+    rs: 0.04 + ((h2 >> 10) % 60) / 1000,
+    a: 0.03 + ((h2 >> 16) % 5) * 0.008
+  });
+}
+
+// ── INPUT ─────────────────────────────────────────────────
+let jx = 0, jy = 0;
+const joy = document.getElementById('joy');
+const stick = document.getElementById('stick');
+joy.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+joy.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.touches[0], r = joy.getBoundingClientRect();
+  jx = Math.max(-1, Math.min(1, (t.clientX - r.left - 70) / 70));
+  jy = Math.max(-1, Math.min(1, (t.clientY - r.top - 70) / 70));
+  stick.style.left = (41 + jx * 35) + 'px';
+  stick.style.top = (41 + jy * 35) + 'px';
+}, { passive: false });
+joy.addEventListener('touchend', () => {
+  jx = jy = 0;
+  stick.style.left = '41px';
+  stick.style.top = '41px';
+});
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; e.preventDefault(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ── RAYCASTING ────────────────────────────────────────────
+function castRay(angle) {
+  const rdx = Math.cos(angle);
+  const rdy = Math.sin(angle);
+
+  let mx = Math.floor(px);
+  let my = Math.floor(py);
+
+  const ddx = Math.abs(rdx) < 1e-10 ? 1e30 : Math.abs(1 / rdx);
+  const ddy = Math.abs(rdy) < 1e-10 ? 1e30 : Math.abs(1 / rdy);
+
+  let stepX, stepY, sdx, sdy;
+  if (rdx < 0) { stepX = -1; sdx = (px - mx) * ddx; }
+  else { stepX = 1; sdx = (mx + 1 - px) * ddx; }
+  if (rdy < 0) { stepY = -1; sdy = (py - my) * ddy; }
+  else { stepY = 1; sdy = (my + 1 - py) * ddy; }
+
+  let side = 0;
+  for (let i = 0; i < 128; i++) {
+    if (sdx < sdy) { sdx += ddx; mx += stepX; side = 0; }
+    else { sdy += ddy; my += stepY; side = 1; }
+    if (isWall(mx, my)) break;
+  }
+
+  const dist = Math.max(0.01,
+    side === 0 ? (sdx - ddx) : (sdy - ddy)
+  );
+  return { dist, side, mx, my };
+}
+
+// ── WALL EFFECT SHAPES ────────────────────────────────────
+// Architectural only: cracks, rust streaks, mortar lines, damp patches, chips, scratches
+function drawEffect(type, cx, wallTop, wallH, tileW) {
+  const tw = Math.max(tileW, 18);
+  const h0 = hash((cx * 7) | 0, (wallTop * 3) | 0);
+
+  switch (type) {
+    case 0: { // Vertical crack with branch
+      ctx.strokeStyle = 'rgba(0,0,0,0.20)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      let ex = cx + (h0 % 9 - 4) * (tw / 70);
+      let ey = wallTop + wallH * 0.10;
+      ctx.moveTo(ex, ey);
+      for (let i = 1; i <= 8; i++) {
+        ex += (hash((cx * 3 + i) | 0, (wallTop + i * 13) | 0) % 7 - 3) * (tw / 55);
+        ey = wallTop + wallH * (0.10 + i / 8 * 0.80);
+        ctx.lineTo(ex, ey);
+        if (i === 4) {
+          ctx.moveTo(ex, ey);
+          ctx.lineTo(ex + tw * 0.13, ey + wallH * 0.07);
+          ctx.moveTo(ex, ey);
+        }
+      }
+      ctx.stroke();
+      break;
+    }
+    case 1: { // Rust / water drip streaks
+      for (let s = 0; s < 3; s++) {
+        const sx = cx + (s - 1) * tw * 0.25;
+        const sy0 = wallTop + wallH * 0.07;
+        const len = wallH * (0.25 + (hash((sx * 7 + s) | 0, (sy0) | 0) % 22) / 55);
+        const grad = ctx.createLinearGradient(sx, sy0, sx, sy0 + len);
+        grad.addColorStop(0, 'rgba(62,32,10,0.26)');
+        grad.addColorStop(0.55, 'rgba(62,32,10,0.10)');
+        grad.addColorStop(1, 'rgba(62,32,10,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(sx - 1.5, sy0, 3, len);
+      }
+      break;
+    }
+    case 2: { // Block mortar joint lines
+      ctx.fillStyle = 'rgba(0,0,0,0.14)';
+      const y1 = wallTop + wallH * 0.30;
+      const y2 = wallTop + wallH * 0.60;
+      ctx.fillRect(cx - tw * 0.48, y1 - 1, tw * 0.96, 2);
+      ctx.fillRect(cx - tw * 0.48, y2 - 1, tw * 0.96, 2);
+      ctx.fillRect(cx + tw * 0.10, y1, 1.5, wallH * 0.30);
+      break;
+    }
+    case 3: { // Damp moisture blotch
+      const rw = tw * 0.42, rh = wallH * 0.20;
+      const ox = cx + (h0 % 11 - 5) * (tw / 60);
+      const oy = wallTop + wallH * (0.35 + (h0 >> 4) % 20 / 100);
+      const grad = ctx.createRadialGradient(ox, oy, 0, ox, oy, Math.max(rw, rh));
+      grad.addColorStop(0, 'rgba(5,8,4,0.22)');
+      grad.addColorStop(0.5, 'rgba(5,8,4,0.09)');
+      grad.addColorStop(1, 'rgba(5,8,4,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.ellipse(ox, oy, rw, rh, 0.18, 0, Math.PI * 2);
+      ctx.fill();
+      break;
+    }
+    case 4: { // Chipped / spalled corner
+      const chipX = cx + (h0 % 2 === 0 ? -tw * 0.20 : tw * 0.08);
+      const chipY = wallTop + wallH * (0.38 + (h0 >> 8) % 20 / 100);
+      ctx.fillStyle = 'rgba(0,0,0,0.19)';
+      ctx.beginPath();
+      ctx.moveTo(chipX, chipY);
+      ctx.lineTo(chipX + tw * 0.16, chipY - wallH * 0.07);
+      ctx.lineTo(chipX + tw * 0.20, chipY + wallH * 0.08);
+      ctx.lineTo(chipX + tw * 0.03, chipY + wallH * 0.10);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,0.08)';
+      ctx.fillRect(chipX, chipY + wallH * 0.09, tw * 0.20, wallH * 0.022);
+      break;
+    }
+    case 5: { // Horizontal scratch marks
+      ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 3; i++) {
+        const sy = wallTop + wallH * (0.36 + i * 0.09);
+        const offA = (hash((cx + i * 17) | 0, (wallTop + i * 5) | 0) % 7 - 3) * 0.5;
+        const offB = (hash((cx + i * 23) | 0, (wallTop + i * 9) | 0) % 7 - 3) * 0.5;
+        ctx.beginPath();
+        ctx.moveTo(cx - tw * 0.30, sy + offA);
+        ctx.lineTo(cx + tw * 0.30, sy + offB);
+        ctx.stroke();
+      }
+      break;
+    }
+  }
+}
+
+// ── RENDER ────────────────────────────────────────────────
+function render() {
+  const W = c.width, H = c.height;
+  const midY = (H * 0.5 + bobY) | 0;
+  const fl = flickerB * (0.96 + 0.04 * Math.sin(driftPhase)) * (1 - heartPulse * 0.025);
+
+  // Ceiling (very dark, warm-tinted black)
+  ctx.fillStyle = `rgb(${(12 * fl) | 0},${(9 * fl) | 0},${(9 * fl) | 0})`;
+  ctx.fillRect(0, 0, W, H);
+
+  // Floor (slightly warmer dark)
+  ctx.fillStyle = `rgb(${(28 * fl) | 0},${(22 * fl) | 0},${(19 * fl) | 0})`;
+  ctx.fillRect(0, midY, W, H - midY);
+
+  // Floor depth gradient (darkens near horizon)
+  const fg = ctx.createLinearGradient(0, midY, 0, H);
+  fg.addColorStop(0, 'rgba(0,0,0,0.55)');
+  fg.addColorStop(0.35, 'rgba(0,0,0,0)');
+  ctx.fillStyle = fg;
+  ctx.fillRect(0, midY, W, H - midY);
+
+  // Ceiling stains
+  for (const s of ceilStains) {
+    const sx = s.rx * W, sy = s.ry * midY, sr = s.rs * Math.min(W, midY) + 10;
+    const g = ctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
+    g.addColorStop(0, `rgba(0,0,0,${s.a})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
+  }
+  // Floor stains
+  for (const s of floorStains) {
+    const sx = s.rx * W, sy = midY + s.ry * (H - midY), sr = s.rs * Math.min(W, H - midY) + 8;
+    const g = ctx.createRadialGradient(sx, sy, 0, sx, sy, sr);
+    g.addColorStop(0, `rgba(0,0,0,${s.a})`);
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(sx - sr, sy - sr, sr * 2, sr * 2);
+  }
+
+  // ── WALL STRIPS ──────────────────────────────────────────
+  const effGroups = new Map();
+
+  for (let x = 0; x < W; x++) {
+    const angle = pa + breathDelta - FOV / 2 + (x / W) * FOV;
+    const { dist, side, mx: wMx, my: wMy } = castRay(angle);
+
+    const wallH = Math.min(H * 4, (H / dist) | 0);
+    const wallTop = ((midY - wallH * 0.5) | 0);
+
+    const distFactor = Math.min(1, 2.2 / (dist + 0.6));
+    const sideMul = side === 0 ? 1.0 : 0.62;
+    const b = distFactor * sideMul * fl;
+
+    const r = Math.min(230, (b * 195 + 22) | 0);
+    const g2 = Math.min(200, (b * 160 + 16) | 0);
+    const b3 = Math.min(180, (b * 145 + 14) | 0);
+    ctx.fillStyle = `rgb(${r},${g2},${b3})`;
+    ctx.fillRect(x, wallTop, 1, wallH);
+
+    if (wallH > 6) {
+      ctx.fillStyle = 'rgba(0,0,0,0.28)';
+      ctx.fillRect(x, wallTop, 1, 3);
+      ctx.fillStyle = 'rgba(0,0,0,0.38)';
+      ctx.fillRect(x, wallTop + wallH - 3, 1, 3);
+    }
+
+    // Group effect tiles for pass 2
+    if (dist < 10) {
+      const eff = tileEffect(wMx, wMy);
+      if (eff >= 0) {
+        const key = `${wMx},${wMy}`;
+        const eg = effGroups.get(key);
+        if (!eg) effGroups.set(key, { x1: x, x2: x, wallTop, wallH, eff });
+        else {
+          eg.x2 = x;
+          if (wallH > eg.wallH) { eg.wallTop = wallTop; eg.wallH = wallH; }
+        }
+      }
+    }
+  }
+
+  // ── PASS 2: EFFECT OVERLAYS ───────────────────────────────
+  for (const [, eg] of effGroups) {
+    const cx = (eg.x1 + eg.x2) / 2;
+    const tw = eg.x2 - eg.x1 + 1;
+    drawEffect(eg.eff, cx, eg.wallTop, eg.wallH, tw);
+  }
+
+  // Horizontal distortion stripe
+  if (distortFrames > 0 && distortRow >= 0 && distortRow < H - 5) {
+    try {
+      const id = ctx.getImageData(0, distortRow, W, 3);
+      ctx.putImageData(id, distortAmt, distortRow + 1);
+    } catch (_) {}
+    distortFrames--;
+  }
+
+  // Ambient colour tint
+  if (tintA > 0.001) {
+    ctx.fillStyle = `rgba(${tintR},${tintG},${tintB2},${tintA})`;
+    ctx.fillRect(0, 0, W, H);
+    tintA = Math.max(0, tintA - tintDecay);
+  }
+
+  // Peripheral shadow (idle)
+  if (peripheralA > 0.002) {
+    const pg = ctx.createRadialGradient(W / 2, H / 2, H * 0.22, W / 2, H / 2, H * 0.82);
+    pg.addColorStop(0, 'rgba(0,0,0,0)');
+    pg.addColorStop(1, `rgba(0,0,0,${peripheralA})`);
+    ctx.fillStyle = pg;
+    ctx.fillRect(0, 0, W, H);
+    peripheralA = Math.max(0, peripheralA - 0.005);
+  }
+
+  // Static burst
+  if (staticA > 0) {
+    const id = ctx.createImageData(W, H);
+    for (let i = 0; i < id.data.length; i += 4) {
+      const v = (Math.random() * 160) | 0;
+      id.data[i] = id.data[i + 1] = id.data[i + 2] = v;
+      id.data[i + 3] = (staticA * 55) | 0;
+    }
+    ctx.putImageData(id, 0, 0);
+    staticA = Math.max(0, staticA - 0.6);
+  }
+
+  // Crosshair
+  const cxC = (W / 2 + bobX) | 0, cyC = (H / 2) | 0;
+  ctx.strokeStyle = 'rgba(210,195,185,0.32)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cxC - 8, cyC); ctx.lineTo(cxC + 8, cyC);
+  ctx.moveTo(cxC, cyC - 8); ctx.lineTo(cxC, cyC + 8);
+  ctx.stroke();
+
+  // Walk tilt via CSS — no ctx matrix issues
+  c.style.transform = `rotate(${(bobTilt * 180 / Math.PI).toFixed(3)}deg)`;
+}
+
+// ── UPDATE ────────────────────────────────────────────────
+function update() {
+  time++;
+
+  let kx = 0, ky = 0;
+  if (keys['ArrowLeft'] || keys['KeyA']) kx = -1;
+  else if (keys['ArrowRight'] || keys['KeyD']) kx = 1;
+  if (keys['ArrowUp'] || keys['KeyW']) ky = -1;
+  else if (keys['ArrowDown'] || keys['KeyS']) ky = 1;
+
+  const mx = jx !== 0 ? jx : kx;
+  const my = jy !== 0 ? jy : ky;
+  isMoving = (mx !== 0 || my !== 0);
+
+  pa += mx * 0.048;
+  const speed = 0.052;
+  const nx = px + Math.cos(pa) * (-my * speed);
+  const ny = py + Math.sin(pa) * (-my * speed);
+  if (!isWall(nx, py)) px = nx;
+  if (!isWall(px, ny)) py = ny;
+
+  // 1. Flicker
+  flickerTimer--;
+  if (flickerTimer <= 0) {
+    flickerB = 0.92 + Math.random() * 0.08;
+    flickerTimer = Math.random() < 0.04 ? (2 + Math.random() * 4) | 0 : (25 + Math.random() * 80) | 0;
+  }
+
+  // 2. Heartbeat
+  heartPulse = Math.max(0, Math.abs(Math.sin(time * 0.011)) - 0.72) * 3.8;
+
+  // 3. Head bob — smooth walk cycle with landing impact
+  const targetSpeed = isMoving ? 1 : 0;
+  moveSpeed += (targetSpeed - moveSpeed) * 0.12;
+  const prevBobPhase = bobPhase;
+  bobPhase += moveSpeed * 0.13;
+  // detect footfall (bob crosses zero going down = foot strike)
+  const prevSin = Math.sin(prevBobPhase);
+  const curSin  = Math.sin(bobPhase);
+  if (prevSin > 0 && curSin <= 0 && isMoving) landImpact = 1.0;
+  landImpact *= 0.82;
+  const bobAmp = moveSpeed * 3.8;
+  bobY  = Math.sin(bobPhase) * bobAmp - landImpact * 2.2;
+  bobX  = Math.sin(bobPhase * 0.5) * moveSpeed * 1.6;
+  bobTilt = Math.sin(bobPhase * 0.5) * moveSpeed * 0.012;
+
+  // 4. Breathing sway
+  breathPhase += 0.007;
+  breathDelta = Math.sin(breathPhase) * 0.0028;
+
+  // 5. Ambient drift
+  driftPhase += 0.006;
+
+  // 6. Idle peripheral vignette
+  idleFrames = isMoving ? 0 : idleFrames + 1;
+  if (idleFrames > 90) {
+    peripheralA = Math.max(peripheralA, 0.09 * Math.sin((idleFrames - 90) * 0.022));
+  }
+
+  // Rare events
+  if (Math.random() < 0.002) {
+    if (Math.random() < 0.6) { tintR = 80; tintG = 0; tintB2 = 0; tintA = 0.06; tintDecay = 0.003; }
+    else { tintR = 0; tintG = 10; tintB2 = 60; tintA = 0.05; tintDecay = 0.0025; }
+  }
+  if (Math.random() < 0.0012) {
+    distortRow = (Math.random() * (c.height - 10)) | 0;
+    distortAmt = ((Math.random() * 10 - 5) | 0);
+    distortFrames = 3;
+  }
+  if (Math.random() < 0.0004) staticA = 1;
+}
+
+// ── AUDIO ─────────────────────────────────────────────────
+let audioCtx = null;
+function getAC() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function startHum() {
+  const ac = getAC();
+  const osc = ac.createOscillator();
+  const lfo = ac.createOscillator();
+  const lfoG = ac.createGain();
+  const filt = ac.createBiquadFilter();
+  const gain = ac.createGain();
+  lfo.frequency.value = 0.18; lfoG.gain.value = 4;
+  lfo.connect(lfoG); lfoG.connect(osc.frequency);
+  osc.type = 'sawtooth'; osc.frequency.value = 48;
+  filt.type = 'lowpass'; filt.frequency.value = 180;
+  gain.gain.value = 0.04;
+  osc.connect(filt); filt.connect(gain); gain.connect(ac.destination);
+  osc.start(); lfo.start();
+}
+
+function playDrip() {
+  const ac = getAC();
+  const osc = ac.createOscillator();
+  const gain = ac.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(820 + Math.random() * 300, ac.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(200, ac.currentTime + 0.18);
+  gain.gain.setValueAtTime(0.07, ac.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 0.22);
+  osc.connect(gain); gain.connect(ac.destination);
+  osc.start(); osc.stop(ac.currentTime + 0.25);
+}
+
+function playStep() {
+  const ac = getAC();
+  const buf = ac.createBuffer(1, (ac.sampleRate * 0.09) | 0, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/d.length, 3.5);
+  const src = ac.createBufferSource();
+  const filt = ac.createBiquadFilter();
+  const gain = ac.createGain();
+  filt.type = 'lowpass'; filt.frequency.value = 280;
+  gain.gain.value = 0.30;
+  src.buffer = buf;
+  src.connect(filt); filt.connect(gain); gain.connect(ac.destination);
+  src.start();
+}
+
+function playBreathe() {
+  const ac = getAC();
+  const len = (ac.sampleRate * 0.55) | 0;
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random()*2-1) * Math.sin(i/len * Math.PI) * 0.35;
+  const src = ac.createBufferSource();
+  const filt = ac.createBiquadFilter();
+  const gain = ac.createGain();
+  filt.type = 'bandpass'; filt.frequency.value = 900; filt.Q.value = 0.6;
+  gain.gain.value = 0.09;
+  src.buffer = buf;
+  src.connect(filt); filt.connect(gain); gain.connect(ac.destination);
+  src.start();
+}
+
+let humStarted = false;
+let dripTimer = (180 + Math.random() * 300) | 0;
+let breathTimer = 320;
+
+function updateAudio() {
+  if (!humStarted && isMoving) {
+    humStarted = true;
+    try { startHum(); } catch(_) {}
+  }
+  if (!humStarted) return;
+  if (isMoving && landImpact > 0.85) { try { playStep(); } catch(_) {} }
+  dripTimer--;
+  if (dripTimer <= 0) { try { playDrip(); } catch(_) {} dripTimer = (200 + Math.random()*400)|0; }
+  if (!isMoving) {
+    breathTimer--;
+    if (breathTimer <= 0) { try { playBreathe(); } catch(_) {} breathTimer = (280 + Math.random()*180)|0; }
+  } else { breathTimer = 60; }
+}
+
+// ── LOOP ──────────────────────────────────────────────────
+let lastTime = 0;
+function loop(ts) {
+  if (ts - lastTime >= 14) {
+    lastTime = ts;
+    update();
+    updateAudio();
+    render();
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
